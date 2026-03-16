@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/rpg"
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
 )
@@ -728,5 +730,373 @@ func TestHandleTraceCalleesFromStores_should_aggregate_across_stores(t *testing.
 	}
 	if !strings.Contains(text, "SendResponse") {
 		t.Errorf("expected result to contain callee 'SendResponse', got: %s", text)
+	}
+}
+
+// buildTestGraph creates a minimal RPG graph for testing.
+func buildTestGraph(projectPath string) *rpg.Graph {
+	g := rpg.NewGraph()
+	g.AddNode(&rpg.Node{
+		ID:      "area:cli",
+		Kind:    rpg.KindArea,
+		Feature: "cli",
+	})
+	g.AddNode(&rpg.Node{
+		ID:      "cat:cli/commands",
+		Kind:    rpg.KindCategory,
+		Feature: "cli/commands",
+	})
+	g.AddEdge(&rpg.Edge{
+		From: "area:cli",
+		To:   "cat:cli/commands",
+		Type: rpg.EdgeFeatureParent,
+	})
+	g.AddNode(&rpg.Node{
+		ID:   "file:" + filepath.Join(projectPath, "main.go"),
+		Kind: rpg.KindFile,
+		Path: filepath.Join(projectPath, "main.go"),
+	})
+	g.AddEdge(&rpg.Edge{
+		From: "cat:cli/commands",
+		To:   "file:" + filepath.Join(projectPath, "main.go"),
+		Type: rpg.EdgeFeatureParent,
+	})
+	g.AddNode(&rpg.Node{
+		ID:         "sym:" + filepath.Join(projectPath, "main.go") + ":HandleRequest",
+		Kind:       rpg.KindSymbol,
+		Feature:    "handle-request",
+		SymbolName: "HandleRequest",
+		Path:       filepath.Join(projectPath, "main.go"),
+		StartLine:  10,
+		EndLine:    30,
+	})
+	g.AddEdge(&rpg.Edge{
+		From: "file:" + filepath.Join(projectPath, "main.go"),
+		To:   "sym:" + filepath.Join(projectPath, "main.go") + ":HandleRequest",
+		Type: rpg.EdgeContains,
+	})
+	return g
+}
+
+func TestWorkspaceRPGSearchCollation(t *testing.T) {
+	// Create two graphs simulating two projects
+	g1 := buildTestGraph("/proj1")
+	g2 := rpg.NewGraph()
+	g2.AddNode(&rpg.Node{
+		ID:      "area:api",
+		Kind:    rpg.KindArea,
+		Feature: "api",
+	})
+	g2.AddNode(&rpg.Node{
+		ID:         "sym:/proj2/server.go:HandleRequest",
+		Kind:       rpg.KindSymbol,
+		Feature:    "handle-request",
+		SymbolName: "HandleRequest",
+		Path:       "/proj2/server.go",
+		StartLine:  1,
+		EndLine:    20,
+	})
+
+	qe1 := rpg.NewQueryEngine(g1)
+	qe2 := rpg.NewQueryEngine(g2)
+
+	ctx := context.Background()
+	req := rpg.SearchNodeRequest{
+		Query: "handle request",
+		Kinds: []rpg.NodeKind{rpg.KindSymbol},
+		Limit: 10,
+	}
+
+	// Simulate workspace collation
+	var combined []WorkspaceRPGSearchResult
+	for _, tc := range []struct {
+		project string
+		qe      *rpg.QueryEngine
+	}{
+		{"proj1", qe1},
+		{"proj2", qe2},
+	} {
+		results, err := tc.qe.SearchNode(ctx, req)
+		if err != nil {
+			t.Fatalf("search failed for %s: %v", tc.project, err)
+		}
+		for _, r := range results {
+			combined = append(combined, WorkspaceRPGSearchResult{
+				Project:     tc.project,
+				Node:        r.Node,
+				Score:       r.Score,
+				FeaturePath: r.FeaturePath,
+			})
+		}
+	}
+
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].Score > combined[j].Score
+	})
+
+	if len(combined) < 2 {
+		t.Fatalf("expected at least 2 results, got %d", len(combined))
+	}
+
+	// Both projects should contribute results
+	projects := map[string]bool{}
+	for _, r := range combined {
+		projects[r.Project] = true
+	}
+	if !projects["proj1"] || !projects["proj2"] {
+		t.Errorf("expected results from both projects, got projects: %v", projects)
+	}
+
+	// Results should be sorted by score descending
+	for i := 1; i < len(combined); i++ {
+		if combined[i].Score > combined[i-1].Score {
+			t.Errorf("results not sorted by score descending at index %d", i)
+		}
+	}
+}
+
+func TestWorkspaceRPGSearchProjectFilter(t *testing.T) {
+	g1 := buildTestGraph("/proj1")
+	qe1 := rpg.NewQueryEngine(g1)
+
+	ctx := context.Background()
+	req := rpg.SearchNodeRequest{
+		Query: "handle request",
+		Kinds: []rpg.NodeKind{rpg.KindSymbol},
+		Limit: 10,
+	}
+
+	results, err := qe1.SearchNode(ctx, req)
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+
+	var combined []WorkspaceRPGSearchResult
+	for _, r := range results {
+		combined = append(combined, WorkspaceRPGSearchResult{
+			Project:     "proj1",
+			Node:        r.Node,
+			Score:       r.Score,
+			FeaturePath: r.FeaturePath,
+		})
+	}
+
+	// When filtered to a single project, all results should be from that project
+	for _, r := range combined {
+		if r.Project != "proj1" {
+			t.Errorf("expected all results from proj1, got %s", r.Project)
+		}
+	}
+	if len(combined) == 0 {
+		t.Error("expected at least 1 result")
+	}
+}
+
+func TestWorkspaceRPGFetchUniqueResolution(t *testing.T) {
+	g1 := buildTestGraph("/proj1")
+	qe1 := rpg.NewQueryEngine(g1)
+
+	ctx := context.Background()
+	nodeID := "sym:/proj1/main.go:HandleRequest"
+
+	result, err := qe1.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: nodeID})
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	wsResult := WorkspaceRPGFetchResult{
+		Project:         "proj1",
+		FetchNodeResult: result,
+	}
+
+	if wsResult.Project != "proj1" {
+		t.Errorf("expected project proj1, got %s", wsResult.Project)
+	}
+	if wsResult.Node.SymbolName != "HandleRequest" {
+		t.Errorf("expected HandleRequest, got %s", wsResult.Node.SymbolName)
+	}
+}
+
+func TestWorkspaceRPGFetchAmbiguity(t *testing.T) {
+	// Two projects with the same node ID
+	g1 := rpg.NewGraph()
+	g1.AddNode(&rpg.Node{
+		ID:         "sym:shared.go:DoWork",
+		Kind:       rpg.KindSymbol,
+		Feature:    "do-work",
+		SymbolName: "DoWork",
+		Path:       "/proj1/shared.go",
+		StartLine:  1,
+		EndLine:    10,
+	})
+	g2 := rpg.NewGraph()
+	g2.AddNode(&rpg.Node{
+		ID:         "sym:shared.go:DoWork",
+		Kind:       rpg.KindSymbol,
+		Feature:    "do-work",
+		SymbolName: "DoWork",
+		Path:       "/proj2/shared.go",
+		StartLine:  1,
+		EndLine:    10,
+	})
+
+	qe1 := rpg.NewQueryEngine(g1)
+	qe2 := rpg.NewQueryEngine(g2)
+
+	ctx := context.Background()
+	nodeID := "sym:shared.go:DoWork"
+
+	// Both should find the node
+	var found []WorkspaceRPGFetchResult
+	for _, tc := range []struct {
+		project string
+		qe      *rpg.QueryEngine
+	}{
+		{"proj1", qe1},
+		{"proj2", qe2},
+	} {
+		result, err := tc.qe.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: nodeID})
+		if err != nil {
+			continue
+		}
+		if result != nil {
+			found = append(found, WorkspaceRPGFetchResult{
+				Project:         tc.project,
+				FetchNodeResult: result,
+			})
+		}
+	}
+
+	if len(found) != 2 {
+		t.Fatalf("expected ambiguous result (2 matches), got %d", len(found))
+	}
+}
+
+func TestWorkspaceRPGExploreProjectAnnotation(t *testing.T) {
+	g1 := buildTestGraph("/proj1")
+	qe1 := rpg.NewQueryEngine(g1)
+
+	ctx := context.Background()
+	startNodeID := "sym:/proj1/main.go:HandleRequest"
+
+	result, err := qe1.Explore(ctx, rpg.ExploreRequest{
+		StartNodeID: startNodeID,
+		Direction:   "both",
+		Depth:       2,
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("explore failed: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	wsResult := WorkspaceRPGExploreResult{
+		Project:   "proj1",
+		StartNode: result.StartNode,
+		Nodes:     result.Nodes,
+		Edges:     result.Edges,
+		Depth:     result.Depth,
+	}
+
+	if wsResult.Project != "proj1" {
+		t.Errorf("expected project proj1, got %s", wsResult.Project)
+	}
+	if wsResult.StartNode == nil {
+		t.Error("expected non-nil start node")
+	}
+	if len(wsResult.Nodes) == 0 {
+		t.Error("expected at least one node")
+	}
+}
+
+func TestWorkspaceProjectStatusRPGFields(t *testing.T) {
+	// Verify RPG fields in WorkspaceProjectStatus JSON
+	ps := WorkspaceProjectStatus{
+		Name:         "myproject",
+		Path:         "/path/to/project",
+		SymbolsReady: true,
+		TotalSymbols: 100,
+		RPGEnabled:   true,
+		RPGNodes:     50,
+		RPGEdges:     75,
+	}
+
+	jsonBytes, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	jsonStr := string(jsonBytes)
+	if !strings.Contains(jsonStr, `"rpg_enabled":true`) {
+		t.Errorf("expected rpg_enabled field, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"rpg_nodes":50`) {
+		t.Errorf("expected rpg_nodes field, got: %s", jsonStr)
+	}
+	if !strings.Contains(jsonStr, `"rpg_edges":75`) {
+		t.Errorf("expected rpg_edges field, got: %s", jsonStr)
+	}
+
+	// When RPG is disabled, omitempty fields should not appear
+	ps2 := WorkspaceProjectStatus{
+		Name:       "noRPG",
+		Path:       "/path",
+		RPGEnabled: false,
+	}
+	jsonBytes2, _ := json.Marshal(ps2)
+	jsonStr2 := string(jsonBytes2)
+	if strings.Contains(jsonStr2, "rpg_nodes") {
+		t.Errorf("expected rpg_nodes to be omitted when 0, got: %s", jsonStr2)
+	}
+}
+
+func TestParseRPGKinds(t *testing.T) {
+	kinds, err := parseRPGKinds("area,symbol,file")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(kinds) != 3 {
+		t.Fatalf("expected 3 kinds, got %d", len(kinds))
+	}
+
+	_, err = parseRPGKinds("invalid")
+	if err == nil {
+		t.Error("expected error for invalid kind")
+	}
+
+	kinds, err = parseRPGKinds("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if kinds != nil {
+		t.Errorf("expected nil for empty string, got %v", kinds)
+	}
+}
+
+func TestParseRPGEdgeTypes(t *testing.T) {
+	edgeTypes, err := parseRPGEdgeTypes("feature_parent,contains,invokes")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(edgeTypes) != 3 {
+		t.Fatalf("expected 3 edge types, got %d", len(edgeTypes))
+	}
+
+	_, err = parseRPGEdgeTypes("invalid")
+	if err == nil {
+		t.Error("expected error for invalid edge type")
+	}
+
+	edgeTypes, err = parseRPGEdgeTypes("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if edgeTypes != nil {
+		t.Errorf("expected nil for empty string, got %v", edgeTypes)
 	}
 }

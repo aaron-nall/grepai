@@ -300,6 +300,12 @@ func (s *Server) registerTools() {
 		mcp.WithString("format",
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
 		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project RPG search (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace to restrict to (requires workspace)"),
+		),
 	)
 	s.mcpServer.AddTool(rpgSearchTool, s.handleRPGSearch)
 
@@ -312,6 +318,12 @@ func (s *Server) registerTools() {
 		),
 		mcp.WithString("format",
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project RPG fetch (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace to restrict to (requires workspace)"),
 		),
 	)
 	s.mcpServer.AddTool(rpgFetchTool, s.handleRPGFetch)
@@ -337,6 +349,12 @@ func (s *Server) registerTools() {
 		),
 		mcp.WithString("format",
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project RPG explore (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace to restrict to (requires workspace)"),
 		),
 	)
 	s.mcpServer.AddTool(rpgExploreTool, s.handleRPGExplore)
@@ -633,6 +651,51 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 		}
 	}
 
+	// RPG enrichment for workspace search results (best-effort)
+	type rpgInfo struct {
+		featurePath string
+		symbolName  string
+	}
+	rpgData := make(map[int]rpgInfo)
+	rpgStores, rpgLoadErr := rpg.LoadWorkspaceRPGStores(ctx, workspaceName, "")
+	if rpgLoadErr != nil {
+		log.Printf("Warning: workspace RPG enrichment unavailable: %v", rpgLoadErr)
+	}
+	if len(rpgStores) > 0 {
+		defer rpg.CloseRPGStores(rpgStores)
+		// Build map: projectName → ProjectRPGStore
+		rpgByProject := make(map[string]rpg.ProjectRPGStore, len(rpgStores))
+		for _, ps := range rpgStores {
+			rpgByProject[ps.ProjectName] = ps
+		}
+		for i, r := range results {
+			// Parse file path: workspaceName/projectName/relativePath
+			parts := strings.SplitN(r.Chunk.FilePath, "/", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			projName := parts[1]
+			relPath := parts[2]
+			ps, ok := rpgByProject[projName]
+			if !ok {
+				continue
+			}
+			graph := ps.Store.GetGraph()
+			// Resolve absolute path for node lookup
+			absPath := filepath.Join(ps.ProjectPath, relPath)
+			nodes := graph.GetNodesByFile(absPath)
+			for _, n := range nodes {
+				if n.Kind == rpg.KindSymbol && n.StartLine <= r.Chunk.EndLine && r.Chunk.StartLine <= n.EndLine {
+					fetchRes, fetchErr := ps.QE.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: n.ID})
+					if fetchErr == nil && fetchRes != nil {
+						rpgData[i] = rpgInfo{featurePath: fetchRes.FeaturePath, symbolName: n.SymbolName}
+					}
+					break
+				}
+			}
+		}
+	}
+
 	var data any
 	if compact {
 		searchResultsCompact := make([]SearchResultCompact, len(results))
@@ -642,6 +705,10 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 				StartLine: r.Chunk.StartLine,
 				EndLine:   r.Chunk.EndLine,
 				Score:     r.Score,
+			}
+			if info, ok := rpgData[i]; ok {
+				searchResultsCompact[i].FeaturePath = info.featurePath
+				searchResultsCompact[i].SymbolName = info.symbolName
 			}
 		}
 		data = searchResultsCompact
@@ -654,6 +721,10 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 				EndLine:   r.Chunk.EndLine,
 				Score:     r.Score,
 				Content:   r.Chunk.Content,
+			}
+			if info, ok := rpgData[i]; ok {
+				searchResults[i].FeaturePath = info.featurePath
+				searchResults[i].SymbolName = info.symbolName
 			}
 		}
 		data = searchResults
@@ -951,7 +1022,12 @@ func (s *Server) resolveWorkspace(workspace string) string {
 
 // enrichTraceSymbols enriches trace symbols with RPG feature paths.
 // It loads the RPG store once and enriches all provided symbols in one pass.
+// Supports both single-project and workspace modes.
 func (s *Server) enrichTraceSymbols(ctx context.Context, symbols ...*trace.Symbol) {
+	if s.workspaceName != "" {
+		s.enrichTraceSymbolsWorkspace(ctx, symbols...)
+		return
+	}
 	if s.projectRoot == "" {
 		return
 	}
@@ -980,6 +1056,38 @@ func (s *Server) enrichTraceSymbols(ctx context.Context, symbols ...*trace.Symbo
 				if fetchErr == nil && fetchResult != nil {
 					sym.FeaturePath = fetchResult.FeaturePath
 				}
+				break
+			}
+		}
+	}
+}
+
+// enrichTraceSymbolsWorkspace enriches trace symbols using workspace RPG stores.
+func (s *Server) enrichTraceSymbolsWorkspace(ctx context.Context, symbols ...*trace.Symbol) {
+	stores, err := rpg.LoadWorkspaceRPGStores(ctx, s.workspaceName, "")
+	if err != nil {
+		log.Printf("Warning: workspace RPG enrichment unavailable: %v", err)
+		return
+	}
+	defer rpg.CloseRPGStores(stores)
+
+	for _, sym := range symbols {
+		if sym == nil || sym.File == "" {
+			continue
+		}
+		for _, ps := range stores {
+			graph := ps.Store.GetGraph()
+			nodes := graph.GetNodesByFile(sym.File)
+			for _, n := range nodes {
+				if n.Kind == rpg.KindSymbol && n.SymbolName == sym.Name {
+					fetchResult, fetchErr := ps.QE.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: n.ID})
+					if fetchErr == nil && fetchResult != nil {
+						sym.FeaturePath = fetchResult.FeaturePath
+					}
+					break
+				}
+			}
+			if sym.FeaturePath != "" {
 				break
 			}
 		}
@@ -1485,6 +1593,9 @@ type WorkspaceProjectStatus struct {
 	Path         string `json:"path"`
 	SymbolsReady bool   `json:"symbols_ready"`
 	TotalSymbols int    `json:"total_symbols"`
+	RPGEnabled   bool   `json:"rpg_enabled"`
+	RPGNodes     int    `json:"rpg_nodes,omitempty"`
+	RPGEdges     int    `json:"rpg_edges,omitempty"`
 }
 
 // handleIndexStatus handles the grepai_index_status tool call.
@@ -1530,6 +1641,17 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 					ps.TotalSymbols = symbolStats.TotalSymbols
 				}
 				ss.Close()
+			}
+			// Check RPG status
+			if cfg, cfgErr := config.Load(p.Path); cfgErr == nil && cfg.RPG.Enabled {
+				rpgSt := rpg.NewGOBRPGStore(config.GetRPGIndexPath(p.Path))
+				if rpgLoadErr := rpgSt.Load(ctx); rpgLoadErr == nil {
+					ps.RPGEnabled = true
+					rpgStats := rpgSt.GetGraph().Stats()
+					ps.RPGNodes = rpgStats.TotalNodes
+					ps.RPGEdges = rpgStats.TotalEdges
+					rpgSt.Close()
+				}
 			}
 			wsStatus.Projects = append(wsStatus.Projects, ps)
 		}
@@ -1829,6 +1951,43 @@ func (s *Server) tryLoadRPG(ctx context.Context) (rpg.RPGStore, *rpg.QueryEngine
 	return rpgStore, qe, nil
 }
 
+// WorkspaceRPGSearchResult is an RPG search result annotated with project name.
+type WorkspaceRPGSearchResult struct {
+	Project     string  `json:"project"`
+	Node        *rpg.Node `json:"node"`
+	Score       float64 `json:"score"`
+	FeaturePath string  `json:"feature_path"`
+}
+
+// parseRPGKinds parses a comma-separated kinds string into NodeKind slice.
+func parseRPGKinds(kindsStr string) ([]rpg.NodeKind, error) {
+	if kindsStr == "" {
+		return nil, nil
+	}
+	var kinds []rpg.NodeKind
+	kindParts := strings.Split(kindsStr, ",")
+	for _, k := range kindParts {
+		k = strings.TrimSpace(k)
+		switch k {
+		case "area":
+			kinds = append(kinds, rpg.KindArea)
+		case "category":
+			kinds = append(kinds, rpg.KindCategory)
+		case "subcategory":
+			kinds = append(kinds, rpg.KindSubcategory)
+		case "file":
+			kinds = append(kinds, rpg.KindFile)
+		case "symbol":
+			kinds = append(kinds, rpg.KindSymbol)
+		case "chunk":
+			kinds = append(kinds, rpg.KindChunk)
+		default:
+			return nil, fmt.Errorf("invalid kind: %s", k)
+		}
+	}
+	return kinds, nil
+}
+
 // handleRPGSearch handles the grepai_rpg_search tool call.
 func (s *Server) handleRPGSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	query, err := request.RequireString("query")
@@ -1840,10 +1999,23 @@ func (s *Server) handleRPGSearch(ctx context.Context, request mcp.CallToolReques
 	kindsStr := request.GetString("kinds", "")
 	limit := request.GetInt("limit", 10)
 	format := request.GetString("format", "json")
+	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
+	project := request.GetString("project", "")
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Parse kinds
+	kinds, kindErr := parseRPGKinds(kindsStr)
+	if kindErr != nil {
+		return mcp.NewToolResultError(kindErr.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		return s.handleWorkspaceRPGSearch(ctx, query, scope, kinds, limit, format, workspace, project)
 	}
 
 	// Load RPG
@@ -1858,31 +2030,6 @@ func (s *Server) handleRPGSearch(ctx context.Context, request mcp.CallToolReques
 		return mcp.NewToolResultError("RPG is not enabled or index is empty"), nil
 	}
 	defer rpgSt.Close()
-
-	// Parse kinds
-	var kinds []rpg.NodeKind
-	if kindsStr != "" {
-		kindParts := strings.Split(kindsStr, ",")
-		for _, k := range kindParts {
-			k = strings.TrimSpace(k)
-			switch k {
-			case "area":
-				kinds = append(kinds, rpg.KindArea)
-			case "category":
-				kinds = append(kinds, rpg.KindCategory)
-			case "subcategory":
-				kinds = append(kinds, rpg.KindSubcategory)
-			case "file":
-				kinds = append(kinds, rpg.KindFile)
-			case "symbol":
-				kinds = append(kinds, rpg.KindSymbol)
-			case "chunk":
-				kinds = append(kinds, rpg.KindChunk)
-			default:
-				return mcp.NewToolResultError(fmt.Sprintf("invalid kind: %s", k)), nil
-			}
-		}
-	}
 
 	// Build request
 	req := rpg.SearchNodeRequest{
@@ -1907,6 +2054,66 @@ func (s *Server) handleRPGSearch(ctx context.Context, request mcp.CallToolReques
 	return mcp.NewToolResultText(output), nil
 }
 
+// handleWorkspaceRPGSearch handles RPG search across workspace projects.
+func (s *Server) handleWorkspaceRPGSearch(ctx context.Context, query, scope string, kinds []rpg.NodeKind, limit int, format, workspace, project string) (*mcp.CallToolResult, error) {
+	stores, err := rpg.LoadWorkspaceRPGStores(ctx, workspace, project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace RPG stores: %v", err)), nil
+	}
+	defer rpg.CloseRPGStores(stores)
+
+	if len(stores) == 0 {
+		return mcp.NewToolResultError("no RPG-enabled projects found in workspace"), nil
+	}
+
+	req := rpg.SearchNodeRequest{
+		Query: query,
+		Scope: scope,
+		Kinds: kinds,
+		Limit: limit,
+	}
+
+	var combined []WorkspaceRPGSearchResult
+	for _, ps := range stores {
+		results, searchErr := ps.QE.SearchNode(ctx, req)
+		if searchErr != nil {
+			log.Printf("Warning: RPG search failed for project %s: %v", ps.ProjectName, searchErr)
+			continue
+		}
+		for _, r := range results {
+			combined = append(combined, WorkspaceRPGSearchResult{
+				Project:     ps.ProjectName,
+				Node:        r.Node,
+				Score:       r.Score,
+				FeaturePath: r.FeaturePath,
+			})
+		}
+	}
+
+	// Sort by score descending
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].Score > combined[j].Score
+	})
+
+	// Truncate to limit
+	if len(combined) > limit {
+		combined = combined[:limit]
+	}
+
+	output, err := encodeOutput(combined, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// WorkspaceRPGFetchResult is an RPG fetch result annotated with project name.
+type WorkspaceRPGFetchResult struct {
+	Project string           `json:"project"`
+	*rpg.FetchNodeResult
+}
+
 // handleRPGFetch handles the grepai_rpg_fetch tool call.
 func (s *Server) handleRPGFetch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	nodeID, err := request.RequireString("node_id")
@@ -1915,10 +2122,17 @@ func (s *Server) handleRPGFetch(ctx context.Context, request mcp.CallToolRequest
 	}
 
 	format := request.GetString("format", "json")
+	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
+	project := request.GetString("project", "")
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		return s.handleWorkspaceRPGFetch(ctx, nodeID, format, workspace, project)
 	}
 
 	// Load RPG
@@ -1953,6 +2167,91 @@ func (s *Server) handleRPGFetch(ctx context.Context, request mcp.CallToolRequest
 	return mcp.NewToolResultText(output), nil
 }
 
+// handleWorkspaceRPGFetch handles RPG fetch across workspace projects.
+func (s *Server) handleWorkspaceRPGFetch(ctx context.Context, nodeID, format, workspace, project string) (*mcp.CallToolResult, error) {
+	stores, err := rpg.LoadWorkspaceRPGStores(ctx, workspace, project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace RPG stores: %v", err)), nil
+	}
+	defer rpg.CloseRPGStores(stores)
+
+	if len(stores) == 0 {
+		return mcp.NewToolResultError("no RPG-enabled projects found in workspace"), nil
+	}
+
+	// Search for node across all stores
+	var found []WorkspaceRPGFetchResult
+	for _, ps := range stores {
+		result, fetchErr := ps.QE.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: nodeID})
+		if fetchErr != nil {
+			continue
+		}
+		if result != nil {
+			found = append(found, WorkspaceRPGFetchResult{
+				Project:         ps.ProjectName,
+				FetchNodeResult: result,
+			})
+		}
+	}
+
+	if len(found) == 0 {
+		return mcp.NewToolResultError(fmt.Sprintf("node not found: %s", nodeID)), nil
+	}
+
+	if len(found) > 1 {
+		projectNames := make([]string, len(found))
+		for i, f := range found {
+			projectNames[i] = f.Project
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("node %q found in multiple projects: %s; specify project parameter to disambiguate", nodeID, strings.Join(projectNames, ", "))), nil
+	}
+
+	output, err := encodeOutput(found[0], format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// parseRPGEdgeTypes parses a comma-separated edge types string.
+func parseRPGEdgeTypes(edgeTypesStr string) ([]rpg.EdgeType, error) {
+	if edgeTypesStr == "" {
+		return nil, nil
+	}
+	var edgeTypes []rpg.EdgeType
+	edgeParts := strings.Split(edgeTypesStr, ",")
+	for _, et := range edgeParts {
+		et = strings.TrimSpace(et)
+		switch et {
+		case "feature_parent":
+			edgeTypes = append(edgeTypes, rpg.EdgeFeatureParent)
+		case "contains":
+			edgeTypes = append(edgeTypes, rpg.EdgeContains)
+		case "invokes":
+			edgeTypes = append(edgeTypes, rpg.EdgeInvokes)
+		case "imports":
+			edgeTypes = append(edgeTypes, rpg.EdgeImports)
+		case "maps_to_chunk":
+			edgeTypes = append(edgeTypes, rpg.EdgeMapsToChunk)
+		case "semantic_sim":
+			edgeTypes = append(edgeTypes, rpg.EdgeSemanticSim)
+		default:
+			return nil, fmt.Errorf("invalid edge type: %s", et)
+		}
+	}
+	return edgeTypes, nil
+}
+
+// WorkspaceRPGExploreResult is an RPG explore result annotated with project name.
+type WorkspaceRPGExploreResult struct {
+	Project   string               `json:"project"`
+	StartNode *rpg.Node            `json:"start_node"`
+	Nodes     map[string]*rpg.Node `json:"nodes"`
+	Edges     []*rpg.Edge          `json:"edges"`
+	Depth     int                  `json:"depth"`
+}
+
 // handleRPGExplore handles the grepai_rpg_explore tool call.
 func (s *Server) handleRPGExplore(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	startNodeID, err := request.RequireString("start_node_id")
@@ -1965,6 +2264,8 @@ func (s *Server) handleRPGExplore(ctx context.Context, request mcp.CallToolReque
 	edgeTypesStr := request.GetString("edge_types", "")
 	limit := request.GetInt("limit", 100)
 	format := request.GetString("format", "json")
+	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
+	project := request.GetString("project", "")
 
 	// Validate format
 	if format != "json" && format != "toon" {
@@ -1974,6 +2275,17 @@ func (s *Server) handleRPGExplore(ctx context.Context, request mcp.CallToolReque
 	// Validate direction
 	if direction != "forward" && direction != "reverse" && direction != "both" {
 		return mcp.NewToolResultError("direction must be 'forward', 'reverse', or 'both'"), nil
+	}
+
+	// Parse edge types
+	edgeTypes, etErr := parseRPGEdgeTypes(edgeTypesStr)
+	if etErr != nil {
+		return mcp.NewToolResultError(etErr.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		return s.handleWorkspaceRPGExplore(ctx, startNodeID, direction, depth, edgeTypes, limit, format, workspace, project)
 	}
 
 	// Load RPG
@@ -1988,31 +2300,6 @@ func (s *Server) handleRPGExplore(ctx context.Context, request mcp.CallToolReque
 		return mcp.NewToolResultError("RPG is not enabled or index is empty"), nil
 	}
 	defer rpgSt.Close()
-
-	// Parse edge types
-	var edgeTypes []rpg.EdgeType
-	if edgeTypesStr != "" {
-		edgeParts := strings.Split(edgeTypesStr, ",")
-		for _, et := range edgeParts {
-			et = strings.TrimSpace(et)
-			switch et {
-			case "feature_parent":
-				edgeTypes = append(edgeTypes, rpg.EdgeFeatureParent)
-			case "contains":
-				edgeTypes = append(edgeTypes, rpg.EdgeContains)
-			case "invokes":
-				edgeTypes = append(edgeTypes, rpg.EdgeInvokes)
-			case "imports":
-				edgeTypes = append(edgeTypes, rpg.EdgeImports)
-			case "maps_to_chunk":
-				edgeTypes = append(edgeTypes, rpg.EdgeMapsToChunk)
-			case "semantic_sim":
-				edgeTypes = append(edgeTypes, rpg.EdgeSemanticSim)
-			default:
-				return mcp.NewToolResultError(fmt.Sprintf("invalid edge type: %s", et)), nil
-			}
-		}
-	}
 
 	// Build request
 	req := rpg.ExploreRequest{
@@ -2035,6 +2322,71 @@ func (s *Server) handleRPGExplore(ctx context.Context, request mcp.CallToolReque
 
 	// Encode output
 	output, err := encodeOutput(result, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleWorkspaceRPGExplore handles RPG explore across workspace projects.
+func (s *Server) handleWorkspaceRPGExplore(ctx context.Context, startNodeID, direction string, depth int, edgeTypes []rpg.EdgeType, limit int, format, workspace, project string) (*mcp.CallToolResult, error) {
+	stores, err := rpg.LoadWorkspaceRPGStores(ctx, workspace, project)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace RPG stores: %v", err)), nil
+	}
+	defer rpg.CloseRPGStores(stores)
+
+	if len(stores) == 0 {
+		return mcp.NewToolResultError("no RPG-enabled projects found in workspace"), nil
+	}
+
+	// Find which store contains the start node (same ambiguity resolution as fetch)
+	type matchInfo struct {
+		store  rpg.ProjectRPGStore
+		result *rpg.ExploreResult
+	}
+	var matches []matchInfo
+
+	req := rpg.ExploreRequest{
+		StartNodeID: startNodeID,
+		Direction:   direction,
+		Depth:       depth,
+		EdgeTypes:   edgeTypes,
+		Limit:       limit,
+	}
+
+	for _, ps := range stores {
+		result, exploreErr := ps.QE.Explore(ctx, req)
+		if exploreErr != nil {
+			continue
+		}
+		if result != nil {
+			matches = append(matches, matchInfo{store: ps, result: result})
+		}
+	}
+
+	if len(matches) == 0 {
+		return mcp.NewToolResultError(fmt.Sprintf("start node not found: %s", startNodeID)), nil
+	}
+
+	if len(matches) > 1 {
+		projectNames := make([]string, len(matches))
+		for i, m := range matches {
+			projectNames[i] = m.store.ProjectName
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("start node %q found in multiple projects: %s; specify project parameter to disambiguate", startNodeID, strings.Join(projectNames, ", "))), nil
+	}
+
+	wsResult := WorkspaceRPGExploreResult{
+		Project:   matches[0].store.ProjectName,
+		StartNode: matches[0].result.StartNode,
+		Nodes:     matches[0].result.Nodes,
+		Edges:     matches[0].result.Edges,
+		Depth:     matches[0].result.Depth,
+	}
+
+	output, err := encodeOutput(wsResult, format)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to encode result: %v", err)), nil
 	}

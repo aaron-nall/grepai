@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Workspace RPG Support**: RPG tools (`grepai_rpg_search`, `grepai_rpg_fetch`, `grepai_rpg_explore`) now work in workspace mode with cross-project collation, project filtering, and ambiguity resolution. Workspace search results include RPG enrichment (feature paths, symbol names). Index status shows per-project RPG stats. Trace symbol enrichment works in workspace mode.
+
 ## [0.35.0] - 2026-03-16
 
 ### Added
