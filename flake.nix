@@ -19,6 +19,9 @@
 
         vendorHash = "sha256-sHIX7RGfVcWf/HZB5a+2ahm4/bOylIZ/u8TealOyEss=";
 
+        # Tests require git which is unavailable in the nix build sandbox
+        doCheck = false;
+
         ldflags = [
           "-s"
           "-w"
