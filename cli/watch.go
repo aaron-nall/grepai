@@ -2638,28 +2638,34 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		}
 	}
 
+	// RPG config: workspace-level takes precedence, fall back to per-project
+	rpgCfg := ws.RPG
+	if !rpgCfg.Enabled {
+		rpgCfg = projectCfg.RPG
+	}
+
 	var rpgStore rpg.RPGStore
 	var rpgEncoder *rpg.RPGEncoder
 	var manager *rpgRealtimeManager
-	if projectCfg.RPG.Enabled {
+	if rpgCfg.Enabled {
 		rpgStore = rpg.NewGOBRPGStore(config.GetRPGIndexPath(project.Path))
 		if err := rpgStore.Load(ctx); err != nil {
 			log.Printf("Warning: failed to load RPG index for %s: %v", project.Path, err)
 		}
 
 		var featureExtractor rpg.FeatureExtractor
-		switch projectCfg.RPG.FeatureMode {
+		switch rpgCfg.FeatureMode {
 		case "llm", "hybrid":
-			if projectCfg.RPG.LLMEndpoint == "" || projectCfg.RPG.LLMModel == "" {
-				log.Printf("Warning: RPG feature_mode=%q but llm_endpoint or llm_model is empty for %s, falling back to local extractor", projectCfg.RPG.FeatureMode, project.Path)
+			if rpgCfg.LLMEndpoint == "" || rpgCfg.LLMModel == "" {
+				log.Printf("Warning: RPG feature_mode=%q but llm_endpoint or llm_model is empty for %s, falling back to local extractor", rpgCfg.FeatureMode, project.Path)
 				featureExtractor = rpg.NewLocalExtractor()
 			} else {
 				featureExtractor = rpg.NewLLMExtractor(rpg.LLMExtractorConfig{
-					Provider: projectCfg.RPG.LLMProvider,
-					Model:    projectCfg.RPG.LLMModel,
-					Endpoint: projectCfg.RPG.LLMEndpoint,
-					APIKey:   projectCfg.RPG.LLMAPIKey,
-					Timeout:  time.Duration(projectCfg.RPG.LLMTimeoutMs) * time.Millisecond,
+					Provider: rpgCfg.LLMProvider,
+					Model:    rpgCfg.LLMModel,
+					Endpoint: rpgCfg.LLMEndpoint,
+					APIKey:   rpgCfg.LLMAPIKey,
+					Timeout:  time.Duration(rpgCfg.LLMTimeoutMs) * time.Millisecond,
 				})
 			}
 		default:
@@ -2667,9 +2673,9 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		}
 
 		rpgEncoder = rpg.NewRPGEncoder(rpgStore, featureExtractor, project.Path, rpg.RPGEncoderConfig{
-			DriftThreshold:       projectCfg.RPG.DriftThreshold,
-			MaxTraversalDepth:    projectCfg.RPG.MaxTraversalDepth,
-			FeatureGroupStrategy: projectCfg.RPG.FeatureGroupStrategy,
+			DriftThreshold:       rpgCfg.DriftThreshold,
+			MaxTraversalDepth:    rpgCfg.MaxTraversalDepth,
+			FeatureGroupStrategy: rpgCfg.FeatureGroupStrategy,
 		})
 		if err := rpgEncoder.BuildFull(ctx, symbolStore, vectorStore, nil); err != nil {
 			log.Printf("Warning: failed to build RPG graph for %s: %v", project.Path, err)

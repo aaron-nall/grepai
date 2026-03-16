@@ -1642,8 +1642,14 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 				}
 				ss.Close()
 			}
-			// Check RPG status
-			if cfg, cfgErr := config.Load(p.Path); cfgErr == nil && cfg.RPG.Enabled {
+			// Check RPG status: workspace-level takes precedence, fall back to per-project
+			rpgEnabled := ws.RPG.Enabled
+			if !rpgEnabled {
+				if cfg, cfgErr := config.Load(p.Path); cfgErr == nil {
+					rpgEnabled = cfg.RPG.Enabled
+				}
+			}
+			if rpgEnabled {
 				rpgSt := rpg.NewGOBRPGStore(config.GetRPGIndexPath(p.Path))
 				if rpgLoadErr := rpgSt.Load(ctx); rpgLoadErr == nil {
 					ps.RPGEnabled = true

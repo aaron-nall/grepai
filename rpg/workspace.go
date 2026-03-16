@@ -18,8 +18,9 @@ type ProjectRPGStore struct {
 
 // LoadWorkspaceRPGStores loads GOB RPG stores for workspace projects.
 // If projectName is non-empty, only that project's store is loaded.
+// RPG enablement is checked at workspace level first, then per-project config.
 // Unlike symbol stores, RPG is optional enrichment — projects that fail to load
-// or have RPG disabled are silently skipped.
+// are silently skipped.
 func LoadWorkspaceRPGStores(ctx context.Context, workspaceName, projectName string) ([]ProjectRPGStore, error) {
 	wsCfg, err := config.LoadWorkspaceConfig()
 	if err != nil {
@@ -51,15 +52,19 @@ func LoadWorkspaceRPGStores(ctx context.Context, workspaceName, projectName stri
 		projects = ws.Projects
 	}
 
+	// Check workspace-level RPG config first
+	wsRPGEnabled := ws.RPG.Enabled
+
 	stores := make([]ProjectRPGStore, 0, len(projects))
 	for _, p := range projects {
-		// Load per-project config to check if RPG is enabled
-		cfg, cfgErr := config.Load(p.Path)
-		if cfgErr != nil {
-			log.Printf("Warning: skipping RPG for project %s: failed to load config: %v", p.Name, cfgErr)
-			continue
+		// Workspace-level RPG takes precedence; fall back to per-project config
+		rpgEnabled := wsRPGEnabled
+		if !rpgEnabled {
+			if cfg, cfgErr := config.Load(p.Path); cfgErr == nil {
+				rpgEnabled = cfg.RPG.Enabled
+			}
 		}
-		if !cfg.RPG.Enabled {
+		if !rpgEnabled {
 			continue
 		}
 
